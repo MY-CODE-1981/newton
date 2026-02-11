@@ -1,0 +1,11 @@
+実行方法:
+cd /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/newton
+
+# ヘッドレス実行（推奨）
+uv run -m newton.examples cloth_franka --viewer null --num-frames 100
+
+# GUI付き実行（ディスプレイ接続時）
+uv run -m newton.examples cloth_franka
+
+# USD出力付き実行
+uv run -m newton.examples cloth_franka --viewer usd --output-path output.usd --num-frames 100

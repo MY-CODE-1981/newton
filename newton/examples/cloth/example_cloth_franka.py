@@ -286,6 +286,29 @@ class Example:
         # Ensure FK evaluation (for non-MuJoCo solvers):
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
+        # Warm up: trigger JIT compilation of all kernel variants that
+        # simulate() will need, so they are ready before graph capture.
+        # The initial collide() above uses default margin, but simulate()
+        # uses cloth_body_contact_margin -- run that path once here.
+        if self.add_cloth:
+            if self.collision_pipeline is not None:
+                self.collision_pipeline.soft_contact_margin = self.cloth_body_contact_margin
+            self.model.collide(
+                self.state_0,
+                collision_pipeline=self.collision_pipeline,
+                soft_contact_margin=self.cloth_body_contact_margin,
+            )
+            # Run one VBD step to compile its kernels too
+            self.cloth_solver.rebuild_bvh(self.state_0)
+            self.cloth_solver.step(
+                self.state_0, self.state_1, self.control, self.contacts, self.sim_dt
+            )
+            # Reset states after warmup
+            self.state_0 = self.model.state()
+            self.state_1 = self.model.state()
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+            self.sim_time = 0.0
+
         # graph capture
         if self.add_cloth:
             self.capture()
@@ -507,10 +530,11 @@ class Example:
         self.generate_control_joint_qd(self.state_0)
         if self.graph:
             wp.capture_launch(self.graph)
+            # graph capture doesn't execute Python, so advance time here
+            self.sim_time += self.frame_dt
         else:
+            # simulate() already advances sim_time via sim_dt per substep
             self.simulate()
-
-        self.sim_time += self.frame_dt
 
     def simulate(self):
         self.cloth_solver.rebuild_bvh(self.state_0)
