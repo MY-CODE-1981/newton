@@ -9,3 +9,11 @@ uv run -m newton.examples cloth_franka
 
 # USD出力付き実行
 uv run -m newton.examples cloth_franka --viewer usd --output-path output.usd --num-frames 100
+
+・シミュレーション
+python aloha_asrti_newton.py --cloth
+・シミュレーション＋RGB画像
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH 
+python aloha_asrti_newton.py --cloth --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy --fold-frame 0 --pin-edge --num-frames 2400 
