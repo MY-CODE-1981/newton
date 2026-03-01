@@ -15,5 +15,135 @@ python aloha_asrti_newton.py --cloth
 ・シミュレーション＋RGB画像
 source /home/initial/miniconda3/etc/profile.d/conda.sh
 conda activate asrti
+cd /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados
 LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH 
-python aloha_asrti_newton.py --cloth --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy --fold-frame 0 --pin-edge --num-frames 2400 
+python aloha_asrti_newton.py --cloth --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy --fold-frame 0 --pin-edge --num-frames 1800
+
+# 20260224
+把持判定
+Usage
+
+  cd AS-RTI-acados
+
+  # Train (full 50 epochs)
+  python -m slip_model.train
+
+  # Evaluate
+  python -m slip_model.eval --checkpoint slip_model/checkpoints/best_model.pt
+
+#動画保存
+ python -m slip_model.visualize --episode angle48_dist70_fric2.0_rep1
+
+# 20260226
+---                                                                                                                                           
+  1. データセット                                                                                                                               
+                                                                                                                                                
+  AS-RTI-acados/slip_dataset/                                                                                                                   
+  ├── angle42_dist35_fric1.5_rep0/                          
+  │   ├── cam_sequence/
+  │   │   ├── 0000_grip_hi_rgb.png, _depth.png, _seg.png
+  │   │   ├── 0000_grip_lo_rgb.png, _depth.png, _seg.png
+  │   │   ├── 0000_top_rgb.png, _depth.png, _seg.png
+  │   │   ├── 0000_low_rgb.png, _depth.png, _seg.png
+  │   │   ├── 0000_meta.npz  (sim_time)
+  │   │   └── ... (~84フレーム/ep)
+  │   ├── log_aloha_joint_data.npz         (q_actual, qd_actual @60Hz)
+  │   ├── log_aloha_joint_data_grip_slip.npz (slip_label, n_lifted @60Hz)
+  │   └── run.log
+  ├── angle42_dist35_fric1.5_rep1/
+  ├── ...
+  └── angle48_dist75_fric3.0_rep2/    (計243エピソード, 15GB)
+
+  Config default: dataset_root = "slip_dataset" (AS-RTI-acadosからの相対パス)
+
+  ---
+  2. コードと実行コマンド
+
+  AS-RTI-acados/slip_model/
+  ├── config.py      # ハイパーパラメータ
+  ├── dataset.py     # SlipDataset (4cam+joint読み込み)
+  ├── model.py       # ResNet-18 + MS-TCN
+  ├── train.py       # 学習ループ
+  ├── eval.py        # 評価
+  ├── relabel.py     # GTラベル修正 (n_liftedベース)
+  └── visualize.py   # 可視化 ← ★v1用のまま、v2未対応
+
+  cd AS-RTI-acados
+
+  # ラベル修正
+  python -m slip_model.relabel
+
+  # 学習
+  python -m slip_model.train
+
+  # 評価
+  python -m slip_model.eval --checkpoint slip_model/checkpoints/best_model.pt
+
+  # 可視化 (現状v1用 → 後述の問題あり)
+  python -m slip_model.visualize --checkpoint slip_model/checkpoints/best_model.pt --episode angle48_dist70_fric2.0_rep
+
+# 20260226
+  新規作成                                                                                                                                      
+   
+  1. slip_model/ablation.py — ablation実験スクリプト                                                                                            
+  2. kiroku/20260226_slip_detection_ablation_study.md — 記録
+
+  ablation.py の構成
+
+  - CONDITIONS dict: A/B/C/D の4条件定義
+  - make_config(): 基本Configから各条件のConfigを生成（dataclasses.replace使用）
+  - checkpoint_path(): 条件Aは既存パス、B/C/Dは ablation_{id}/ 以下
+  - run_ablation(): メインロジック
+    - 条件A: 既存checkpoint → evaluate() のみ
+    - 条件B/C/D: train() → evaluate() を順次実行
+    - 全結果の比較表コンソール出力
+    - slip_model/logs/ablation_results.json に保存
+  - main(): argparse（--device, --epochs, --skip-train）
+
+  動作確認
+
+  Import と Config 生成を検証済み:
+  A: cameras=4cam, joint=True,  in_ch=20
+  B: cameras=4cam, joint=False, in_ch=20
+  C: cameras=2cam, joint=True,  in_ch=10
+  D: cameras=2cam, joint=False, in_ch=10
+
+  実行方法
+
+  cd AS-RTI-acados
+  python -m slip_model.ablation                    # フル実行
+  python -m slip_model.ablation --epochs 30        # epoch数指定
+  python -m slip_model.ablation --skip-train       # eval only（要既存ckpt）
+
+# 20260301
+● あなたの元の指示                                                                                           
+                                                                                                               
+  「adjflow (CA-FM) による布把持ラストワンマイル問題の解決」の設計プランを実装せよ、というものでした。具体的に 
+  は以下の5ファイルを新規作成する計画です：                                                                    
+                                                                                                               
+  1. adjflow/src/datasets/grasp3d.py — 把持データセット                                                      
+  2. adjflow/configs/grasp3d.yaml — 設定ファイル                                                               
+  3. adjflow/scripts/train_grasp_cafm.py — 学習スクリプト
+  4. AS-RTI-acados/test_adjflow_cloth_lastmile.py — 統合テスト
+  5. AS-RTI-acados/eval_adjflow_lastmile.py — 評価スクリプト
+
+  作成したもの
+
+  上記5ファイル + 設計図kiroku (adjflow/kiroku/20260301_cafm_grasp3d_lastmile_design.md) を全て作成済みです。
+
+  やっていること（一言で）
+
+  既存の aloha_asrti_newton.py のMPC制御はそのまま。Phase 1開始時（t=2.0s）に布コーナー位置を観測し、CA-FM（adj
+  flowの4フェーズ学習モデル）で精密把持位置を予測、それをMPCターゲットに注入する仕組みです。
+
+  [布コーナー観測] → [CA-FM推論] → [MPC TARGETS更新] → [既存MPC制御]
+
+  実行手順は選択されたコマンドの延長線上で：
+  # Step 1: CA-FM学習
+  cd adjflow && python scripts/train_grasp_cafm.py
+
+  # Step 2: 統合テスト（選択されたコマンドに --cafm-checkpoint を追加した形）
+  cd AS-RTI-acados
+  python test_adjflow_cloth_lastmile.py --cloth --pin-edge \
+      --fold-npy .../trajectory_angle47_dist70.npy \
+      --cafm-checkpoint ../adjflow/checkpoints/grasp_cafm.pt
