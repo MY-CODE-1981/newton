@@ -145,5 +145,385 @@ Usage
   # Step 2: 統合テスト（選択されたコマンドに --cafm-checkpoint を追加した形）
   cd AS-RTI-acados
   python test_adjflow_cloth_lastmile.py --cloth --pin-edge \
-      --fold-npy .../trajectory_angle47_dist70.npy \
+      --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
       --cafm-checkpoint ../adjflow/checkpoints/grasp_cafm.pt
+
+
+# 20260304
+# 布広げデータ保存
+  Created: AS-RTI-acados/fold_cloth_newton.py (~290 lines)                                                           
+                                                                                                                     
+  What it does                                                                                                       
+                                                                                                                     
+  Simulates cloth corner folding using Newton physics with kinematic vertex control (no robot gripper). Generates NPY
+   trajectory files compatible with the existing pipeline (_apply_fold_from_npy).
+
+  Architecture
+
+  - Scene: Cloth mesh from OBJ + ground plane, VBD solver only (no robot/Featherstone)
+  - Grasp mechanism: Pins corner vertices (inv_mass=0) and updates their positions each frame along the trajectory
+  - 3-phase trajectory: Lift (smoothstep 0-15%) → Travel (linear XY, 15-85%) → Descend (smoothstep 85-100%)
+  - Follows Newton Example pattern: __init__/step()/render() with newton.examples.run()
+
+  Key parameters
+
+  ┌──────────────────┬───────────────────────────┬──────────────────────────────────────────────────┐
+  │       Flag       │          Default          │                   Description                    │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --angle          │ 45                        │ Fold direction in degrees (0=+X, 90=+Y)          │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --distance       │ 70                        │ Travel distance as % of cloth diagonal (~0.332m) │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --corner         │ 0                         │ Corner vertex (0/48/2254/2302)                   │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --pin-edge       │ off                       │ Pin yellow-green edge (47 vertices)              │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --num-frames     │ 600                       │ Simulation frames                                │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --save-interval  │ 4                         │ Record every N frames                            │
+  ├──────────────────┼───────────────────────────┼──────────────────────────────────────────────────┤
+  │ --trajectory-dir │ ./cloth_trajectory_newton │ Output directory                                 │
+  └──────────────────┴───────────────────────────┴──────────────────────────────────────────────────┘
+
+  Output
+
+  - fold/trajectory_angle{A}_dist{D}.npy — shape (N_saved, 2303, 3), local coords
+  - unfold/trajectory_angle{A}_dist{D}.npy — time-reversed version
+  - trajectory_angle{A}_dist{D}_metadata.json — parameters + grasp indices
+
+  Usage
+
+  conda activate asrti
+  cd cloth_folding_data_collection-main_20260206_newton
+
+  # Interactive (with viewer)
+  PYTHONPATH=newton:$PYTHONPATH python AS-RTI-acados/fold_cloth_newton.py \
+      --angle 47 --distance 70 --pin-edge
+
+  # Headless batch
+  PYTHONPATH=newton:$PYTHONPATH python AS-RTI-acados/fold_cloth_newton.py \
+      --viewer null --angle 47 --distance 70 --pin-edge \
+      --num-frames 600 --save-interval 4
+  
+  上記の別版？
+
+  # 3フレームだけ
+  python render_sensor_newton.py \
+      --trajectory-file ./cloth_trajectory_newton/unfold/trajectory_angle47_dist70.npy \
+      --frame-index 0 74 149
+
+  # 全フレーム一括
+  python render_sensor_newton.py \
+      --trajectory-dir ./cloth_trajectory_newton/unfold/
+
+GPU実行コマンド集
+
+前提:
+- `cuda124` を使う
+- conda環境は `asrti`
+- Newton/Warp は `--device cuda:0`
+- 比較実験は並列ではなく serial 実行を推奨
+- 現在の `simple_corner_detector.py` は tuned radial version
+
+共通の実行形:
+
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null ...
+'
+
+
+# 20260306
+GPU実行コマンド集
+
+目的:
+- CA-FM last-mile 実験を GPU で再現するための実行メモ
+- `vision` と `oracle` の比較、`auto` fallback の確認をすぐ回せるようにする
+- どのコマンドが何の比較なのかを、このファイルだけで分かるようにする
+
+前提:
+- `cuda124` を使う
+- conda環境は `asrti`
+- Newton / Warp は `--device cuda:0`
+- 比較実験は並列ではなく serial 実行を推奨
+- 現在の `simple_corner_detector.py` は tuned radial version
+- 実行本体は `AS-RTI-acados/test_adjflow_cloth_lastmile.py`
+
+重要フラグの意味:
+- `--corner-source vision`
+  画像ベース corner detector だけを使う。oracle fallback しない。
+- `--corner-source oracle`
+  シミュレーションの live cloth corner を直接使う。基準線。
+- `--corner-source auto`
+  vision を試し、confidence が閾値未満なら oracle fallback する。
+- `--corner-min-confidence X`
+  auto / vision で受理する最小 confidence。
+- `--cafm-inject-time 2.0`
+  `t=2.0s` で corner を観測し、CA-FM の grasp を MPC target に注入する。
+- `--num-frames 240`
+  注入後に少し先まで挙動を見たい本番寄りの長さ。
+- `--num-frames 140`
+  注入の成否と grasp 近辺だけを見る短めの確認。
+- `--output-dir /tmp/...`
+  出力先。主に以下が保存される。
+  - `log_lastmile_cafm.npz`
+  - `log_lastmile_cafm_cameras.npz`
+  - `metrics_lastmile_cafm.npz`
+
+共通の実行形:
+
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null ...
+'
+
+
+# -----------------------------------------------------------------------------
+# 1. angle47_dist70: 基本比較セット
+# -----------------------------------------------------------------------------
+
+# 1-1. tuned vision / 240 frames
+# 何をするか:
+# - tuned radial corner detector を使って CA-FM last-mile を実行
+# - `angle47_dist70` の vision 側の本命結果を取る
+# 何と比較するか:
+# - 直下の oracle baseline
+# 出力先:
+# - /tmp/lastmile_gpu_240_t2_vision_radial
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_240_t2_vision_radial
+'
+
+# 1-2. oracle / 240 frames
+# 何をするか:
+# - live cloth corner を直接使う oracle baseline
+# 何のためか:
+# - vision detector の誤差を測る基準線
+# 出力先:
+# - /tmp/lastmile_gpu_240_t2_oracle
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source oracle --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_240_t2_oracle
+'
+
+
+# -----------------------------------------------------------------------------
+# 2. angle45_dist50: 別軌道の汎化確認セット
+# -----------------------------------------------------------------------------
+
+# 2-1. tuned vision / 240 frames
+# 何をするか:
+# - tuned detector が別軌道でも oracle に近いかを見る
+# 出力先:
+# - /tmp/lastmile_gpu_240_t2_vision_radial_angle45_dist50
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_240_t2_vision_radial_angle45_dist50
+'
+
+# 2-2. oracle / 240 frames
+# 何をするか:
+# - 上の vision run の比較基準を取る
+# 出力先:
+# - /tmp/lastmile_gpu_240_t2_oracle_angle45_dist50
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source oracle --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_240_t2_oracle_angle45_dist50
+'
+
+
+# -----------------------------------------------------------------------------
+# 3. auto fallback 検証セット
+# -----------------------------------------------------------------------------
+
+# 3-1. auto / min-confidence 0.5 / 140 frames
+# 何をするか:
+# - vision confidence が十分高ければ、そのまま vision を採用する確認
+# 期待する結果:
+# - `corner_source_used = vision`
+# 出力先:
+# - /tmp/lastmile_gpu_140_t2_auto_conf05_angle45_dist50_serial
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.5 --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_140_t2_auto_conf05_angle45_dist50_serial
+'
+
+# 3-2. auto / min-confidence 0.95 / 140 frames
+# 何をするか:
+# - threshold をわざと高くして oracle fallback を強制する確認
+# 期待する結果:
+# - `corner_source_used = oracle_fallback`
+# 出力先:
+# - /tmp/lastmile_gpu_140_t2_auto_conf095_angle45_dist50_serial
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.95 --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_140_t2_auto_conf095_angle45_dist50_serial
+'
+
+
+# -----------------------------------------------------------------------------
+# 4. まず何を打てばいいか
+# -----------------------------------------------------------------------------
+
+# 最初に打つ1本:
+# - tuned vision が本当に動くかだけ見たいとき
+# - まずはこの 1 本で良い
+# - 結果は `metrics_lastmile_cafm.npz` を見る
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --output-dir /tmp/lastmile_gpu_240_t2_vision_radial_angle45_dist50
+'
+
+###
+1. 既存NPYにドリフト補正を適用
+
+  conda activate asrti
+  cd /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton
+
+  python AS-RTI-acados/batch_correct_drift.py
+
+  出力:
+  === v4: 28 fold NPYs ===
+    trajectory_angle-42_dist35.npy: 148/150 frames  (rot=0.9° trans=7.5mm)
+    trajectory_angle-42_dist40.npy: 149/150 frames  (rot=0.9° trans=4.5mm)
+    ...
+    trajectory_angle-48_dist40.npy: 149/150 frames  (rot=6.5° trans=28.9mm)  ← v4最大
+    ...
+    -> ./cloth_trajectory_newton_v4_v2/fold/
+    -> ./cloth_trajectory_newton_v4_v2/unfold/
+
+  === v5: 28 fold NPYs ===
+    ...
+    trajectory_angle-45_dist65.npy: 149/150 frames  (rot=4.1° trans=14.2mm)
+    trajectory_angle-45_dist70.npy: 149/150 frames  (rot=9.3° trans=29.5mm)  ← v5最大
+    trajectory_angle-48_dist70.npy: 149/150 frames  (rot=9.4° trans=16.1mm)
+    ...
+    -> ./cloth_trajectory_newton_v5_v2/fold/
+    -> ./cloth_trajectory_newton_v5_v2/unfold/
+
+  2. v5 エッジ深度レンダリング
+
+  python AS-RTI-acados/render_sensor_newton_v5.py \
+      --trajectory-dir ./cloth_trajectory_newton_v5_v2/unfold/ \
+      --output-dir ./sensor_output_newton_v5_unfold_edge_v2
+
+  3. v4 エッジ深度レンダリング
+
+  python AS-RTI-acados/render_sensor_newton_v4.py \
+      --trajectory-dir ./cloth_trajectory_newton_v4_v2/unfold/ \
+      --output-dir ./sensor_output_newton_v4_unfold_edge_v2
+
+  結果
+
+  ┌─────────────────────────────────────────┬──────────────────┬───────────────────┬──────────┬────────┐
+  │                 出力先                  │     パターン     │ フレーム/パターン │ 総画像数 │ サイズ │
+  ├─────────────────────────────────────────┼──────────────────┼───────────────────┼──────────┼────────┤
+  │ cloth_trajectory_newton_v5_v2/          │ 28 (fold+unfold) │ 150               │ —        │ NPY    │
+  ├─────────────────────────────────────────┼──────────────────┼───────────────────┼──────────┼────────┤
+  │ cloth_trajectory_newton_v4_v2/          │ 28 (fold+unfold) │ 150               │ —        │ NPY    │
+  ├─────────────────────────────────────────┼──────────────────┼───────────────────┼──────────┼────────┤
+  │ sensor_output_newton_v5_unfold_edge_v2/ │ 28               │ 150               │ 58,800   │ 576MB  │
+  ├─────────────────────────────────────────┼──────────────────┼───────────────────┼──────────┼────────┤
+  │ sensor_output_newton_v4_unfold_edge_v2/ │ 28               │ 150               │ 58,800   │ 582MB  │
+  └─────────────────────────────────────────┴──────────────────┴───────────────────┴──────────┴────────┘
+
+  解像度: 640×510（Real画像と同一）、1フレーム14枚（RGB/depth/mask/edge_depth/edge_mask × top/low）

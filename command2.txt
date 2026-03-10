@@ -1,0 +1,701 @@
+GPU実行コマンド集
+
+目的:
+- `CA-FM last-mile` の `direct` と `two_stage` を GPU で再現する
+- 2軌道での比較、`two_stage` の小さな sweep、solver trace 収集まで回せるようにする
+- コマンドだけでなく、何を比較しているかもこのファイルだけで分かるようにする
+
+前提:
+- `cuda124` を使う
+- conda 環境は `asrti`
+- Newton / Warp は `--device cuda:0`
+- GPU 比較実験は並列ではなく serial 実行を推奨
+- 実行本体は `AS-RTI-acados/test_adjflow_cloth_lastmile.py`
+
+推奨既定値:
+- `--lastmile-mode two_stage`
+- `--corner-source auto`
+- `--corner-min-confidence 0.80`
+- `--lastmile-ramp-sec 0.50`
+- `solver-flow` を 1 値に統一するなら `--solver-flow-mix 0.20`
+- `140 frame` の短尺 smoke だけなら `--solver-flow-mix 0.50` が速い条件もある
+- `num_frames` で自動切替したいなら `--solver-flow-mix-policy auto --solver-flow-mix-short 0.50 --solver-flow-mix-long 0.20 --solver-flow-mix-short-max-frames 140`
+- short の `residual fallback` 既定値は `--solver-flow-residual-threshold 1.0 --solver-flow-residual-min-scale 0.20 --solver-flow-residual-mode max_all`
+- `threshold=1.0` は `angle47_dist70 / 140 frames` の rerun でも baseline 比 `prep mean -1.34ms`, `prep p99 -9.04ms`, `final corner delta 0.176mm`
+- `--solver-flow-residual-mode stat_only` はこの系では不要。`res_stat` が支配的なので `max_all` と実質同じになる
+- ただし現時点の `auto` は convenience 用。長尺 benchmark は固定 `--solver-flow-mix 0.20` の方が読みやすい
+- `residual fallback` は short では有効だが、long ではまだ fixed `0.20` の完全代替ではない
+- `learned corrector` は exploratory。short smoke 1本では `corrector_mix=0.20` で baseline 比 `prep mean -1.64ms`, `prep p99 -11.72ms`, `final corner delta 0.056mm`
+- 詳細比較は `adjflow/kiroku/20260307_solver_flow_cross_horizon_mix020.md` と `adjflow/kiroku/20260307_solver_flow_auto_mix_policy.md` と `adjflow/kiroku/20260307_solver_flow_residual_fallback.md` と `adjflow/kiroku/20260307_solver_flow_residual_sweep_and_modes.md`
+- まずは `trajectory_angle45_dist50.npy` で確認し、その後 `angle47_dist70.npy` に広げる
+
+重要フラグ:
+- `--corner-source vision`
+  深度ベース detector で corner を使う
+- `--corner-source oracle`
+  cloth fold corner の GT を使う
+- `--corner-source auto`
+  confidence が閾値未満なら oracle fallback
+- `--lastmile-mode direct`
+  `grasp_pos` をそのまま Phase 1-4 の target に差し替える旧方式
+- `--lastmile-mode two_stage`
+  `trust / ramp / z_track` を持つ plan を作り、solver 側で時間方向に target を blend する方式
+- `--lastmile-ramp-sec`
+  `two_stage` の solver-side blending の基準時間
+- `--corner-min-confidence`
+  `auto` で vision corner を採用する最低 confidence
+- `--save-solver-trace`
+  horizon の `x / u / yref / target` などを trace として保存する
+
+共通の実行形:
+
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null ...
+'
+
+
+# 0. 普段使いの既定コマンド
+
+# 0-1. 推奨既定値で two_stage を 1 本回す
+# まず最初に打つならこれ。比較ではなく、今の推奨設定での本命 run。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/lastmile_gpu_default_angle45_dist50
+'
+
+
+
+# 0-2. solver-flow mix の自動切替を確認する
+
+# 0-2-a. angle47_dist70 / 140 frames / auto mix
+# 目的: `num_frames <= 140` で `effective_mix=0.50` になることを確認する。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u   /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py   --device cuda:0 --headless --viewer null   --cloth --pin-edge --num-frames 140   --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy   --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt   --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0   --lastmile-mode two_stage --lastmile-ramp-sec 0.50   --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt   --solver-flow-device cuda --solver-flow-min-confidence 0.50   --solver-flow-mix-policy auto --solver-flow-mix-short 0.50 --solver-flow-mix-long 0.20 --solver-flow-mix-short-max-frames 140   --output-dir /tmp/lastmile_gpu_140_t2_two_stage_angle47_solverflow_auto
+'
+
+# 0-2-b. angle47_dist70 / 2400 frames / auto mix
+# 目的: `num_frames > 140` で `effective_mix=0.20` になることを確認する。
+# 注意: 現状の long-run benchmark は固定 `--solver-flow-mix 0.20` の方が timing を読みやすい。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u   /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py   --device cuda:0 --headless --viewer null   --cloth --pin-edge --num-frames 2400   --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy   --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt   --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0   --lastmile-mode two_stage --lastmile-ramp-sec 0.50   --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt   --solver-flow-device cuda --solver-flow-min-confidence 0.50   --solver-flow-mix-policy auto --solver-flow-mix-short 0.50 --solver-flow-mix-long 0.20 --solver-flow-mix-short-max-frames 140   --output-dir /tmp/lastmile_gpu_2400_t2_two_stage_angle47_solverflow_auto
+'
+
+
+# 0-3. residual fallback を確認する
+
+# 0-3-a. angle47_dist70 / 140 frames / auto + residual fallback
+# 目的: short horizon で `residual_scale < 1` により alpha を落とし、timing が改善するかを見る。
+# 推奨: `threshold=1.0`, `min_scale=0.20`, `residual_mode=max_all`
+# 2026-03-07 rerun: baseline 比 `prep mean -1.34ms`, `prep p99 -9.04ms`, `final corner delta 0.176mm`
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u   /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py   --device cuda:0 --headless --viewer null   --cloth --pin-edge --num-frames 140   --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy   --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt   --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0   --lastmile-mode two_stage --lastmile-ramp-sec 0.50   --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt   --solver-flow-device cuda --solver-flow-min-confidence 0.50   --solver-flow-mix-policy auto --solver-flow-mix-short 0.50 --solver-flow-mix-long 0.20 --solver-flow-mix-short-max-frames 140   --solver-flow-residual-threshold 1.0 --solver-flow-residual-min-scale 0.20 --solver-flow-residual-mode max_all   --output-dir /tmp/lastmile_gpu_140_t2_two_stage_angle47_solverflow_auto_res1p0
+'
+
+# 0-3-b. angle47_dist70 / 2400 frames / auto + residual fallback
+# 目的: long horizon で auto long-run の timing 悪化をどこまで抑えられるかを見る。
+# 注意: 現時点では fixed `--solver-flow-mix 0.20` の方が benchmark 基準としては安定。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u   /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py   --device cuda:0 --headless --viewer null   --cloth --pin-edge --num-frames 2400   --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy   --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt   --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0   --lastmile-mode two_stage --lastmile-ramp-sec 0.50   --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt   --solver-flow-device cuda --solver-flow-min-confidence 0.50   --solver-flow-mix-policy auto --solver-flow-mix-short 0.50 --solver-flow-mix-long 0.20 --solver-flow-mix-short-max-frames 140   --solver-flow-residual-threshold 1.0 --solver-flow-residual-min-scale 0.20 --solver-flow-residual-mode max_all   --output-dir /tmp/lastmile_gpu_2400_t2_two_stage_angle47_solverflow_auto_res1p0
+'
+
+# 1. direct vs two_stage の比較
+
+# 1-1. trajectory_angle45_dist50 / direct / 240 frames
+# 旧方式。把持点を一発で target に差し替える baseline。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode direct \
+  --output-dir /tmp/lastmile_gpu_240_t2_direct_angle45_dist50
+'
+
+# 1-2. trajectory_angle45_dist50 / two_stage / 240 frames
+# 新方式。Task Flow plan を作り、solver 側で time-varying target にして使う。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.75 \
+  --output-dir /tmp/lastmile_gpu_240_t2_two_stage_angle45_dist50
+'
+
+# 1-3. trajectory_angle47_dist70 / direct / 240 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode direct \
+  --output-dir /tmp/lastmile_gpu_240_t2_direct_angle47_dist70
+'
+
+# 1-4. trajectory_angle47_dist70 / two_stage / 240 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.75 \
+  --output-dir /tmp/lastmile_gpu_240_t2_two_stage_angle47_dist70
+'
+
+
+# 2. two_stage の小さな parameter sweep
+
+# 2-1. ramp time sweep
+# 目的: solver を揺らさずに、どこまで速く blend できるかを確認する。
+
+# ramp = 0.50s
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_ramp050_angle45_dist50
+'
+
+# ramp = 0.75s
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.75 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_ramp075_angle45_dist50
+'
+
+# ramp = 1.00s
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source vision --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 1.00 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_ramp100_angle45_dist50
+'
+
+# 2-2. confidence sweep
+# 目的: auto fallback をどこで切ると良いかを見る。
+
+# threshold = 0.50
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.50 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.75 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_auto_conf050_angle45_dist50
+'
+
+# threshold = 0.80
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.75 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_auto_conf080_angle45_dist50
+'
+
+# threshold = 0.95
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.95 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.75 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_auto_conf095_angle45_dist50
+'
+
+
+# 3. solver trace の収集
+
+# 3-1. one run だけ trace を保存する
+# 目的: `x/u/yref/TARGETS/corner_confidence/lastmile_trust` を学習用に残す。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/collect_solver_traces.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/solver_trace_angle45_dist50 \
+  --save-solver-trace
+'
+
+# 3-2. solver-flow baseline を学習する
+# 目的: solver trace から `delta_z` の one-shot supervised baseline を作る。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+cd /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow
+python scripts/train_solver_flow.py \
+  /tmp/solver_trace_angle45_dist50/log_lastmile_cafm_solver_trace.npz \
+  --device cuda \
+  --batch-size 64 \
+  --n-iters 3000 \
+  --eval-every 100 \
+  --output-dir checkpoints/solver_flow_baseline_angle45
+'
+
+# 3-3. full-phase trace を 2 軌道で収集する
+# 目的: `phase 0..10` 全体を含む solver trace を作り、multi-trace 学習に使う。
+
+# angle45_dist50 / full-phase / 2400 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/collect_solver_traces.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 2400 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/solver_trace_angle45_dist50_fullphase \
+  --save-solver-trace
+'
+
+# angle47_dist70 / full-phase / 2400 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/collect_solver_traces.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 2400 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/solver_trace_angle47_dist70_fullphase \
+  --save-solver-trace
+'
+
+# 3-4. full-phase 2-trace で solver-flow を学習する
+# 目的: `angle45 + angle47` を混ぜた multi-trace checkpoint を作る。
+bash -ic '
+miniconda
+conda activate raggedi
+cd /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow
+python scripts/train_solver_flow.py \
+  /tmp/solver_trace_angle45_dist50_fullphase \
+  /tmp/solver_trace_angle47_dist70_fullphase \
+  --device cuda \
+  --batch-size 64 \
+  --n-iters 5000 \
+  --eval-every 100 \
+  --log-every 50 \
+  --output-dir /tmp/solver_flow_raggedi_angle45_angle47_fullphase
+'
+
+# 3-5. online warm-start を比較する
+# 目的: `two_stage` baseline と `two_stage + solver_flow warm-start` の差を見る。
+
+# baseline / angle45_dist50 / 140 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_baseline_after_solverflow_patch
+'
+
+# solver-flow warm-start / angle45_dist50 / 140 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt \
+  --solver-flow-mix 0.50 \
+  --solver-flow-min-confidence 0.50 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_solverflow_smoke
+'
+
+
+
+# 3-6. extended online warm-start 比較
+# 目的: `240` と `2400` で solver-flow の効果を baseline と同条件で見る。
+
+# baseline / angle45_dist50 / 240 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/lastmile_gpu_240_t2_two_stage_angle45_baseline
+'
+
+# solver-flow / angle45_dist50 / 240 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt \
+  --solver-flow-mix 0.50 \
+  --solver-flow-min-confidence 0.50 \
+  --output-dir /tmp/lastmile_gpu_240_t2_two_stage_angle45_solverflow
+'
+
+# baseline / angle47_dist70 / 240 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/lastmile_gpu_240_t2_two_stage_angle47_baseline
+'
+
+# solver-flow / angle47_dist70 / 240 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 240 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt \
+  --solver-flow-mix 0.50 \
+  --solver-flow-min-confidence 0.50 \
+  --output-dir /tmp/lastmile_gpu_240_t2_two_stage_angle47_solverflow
+'
+
+# baseline / angle45_dist50 / 2400 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 2400 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --output-dir /tmp/lastmile_gpu_2400_t2_two_stage_angle45_baseline
+'
+
+# solver-flow / angle45_dist50 / 2400 frames
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 2400 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt \
+  --solver-flow-mix 0.50 \
+  --solver-flow-min-confidence 0.50 \
+  --output-dir /tmp/lastmile_gpu_2400_t2_two_stage_angle45_solverflow
+'
+
+
+# solver-flow / angle45_dist50 / 2400 frames / conservative mix
+# 目的: 長尺の共通既定値候補として `mix=0.20` が angle45 でも破綻しないかを見る。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u   /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py   --device cuda:0 --headless --viewer null   --cloth --pin-edge --num-frames 2400   --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle45_dist50.npy   --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt   --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0   --lastmile-mode two_stage --lastmile-ramp-sec 0.50   --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt   --solver-flow-mix 0.20   --solver-flow-min-confidence 0.50   --output-dir /tmp/lastmile_gpu_2400_t2_two_stage_angle45_solverflow_mix020
+'
+
+# solver-flow / angle47_dist70 / 2400 frames / conservative mix
+# 目的: `mix=0.20` に落として long-run drift を抑えられるかを見る。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u   /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py   --device cuda:0 --headless --viewer null   --cloth --pin-edge --num-frames 2400   --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy   --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt   --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0   --lastmile-mode two_stage --lastmile-ramp-sec 0.50   --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt   --solver-flow-mix 0.20   --solver-flow-min-confidence 0.50   --output-dir /tmp/lastmile_gpu_2400_t2_two_stage_angle47_solverflow_mix020
+'
+
+# 4. 最初に打つコマンド
+
+# まずはこの順でよい:
+# 1. `0-1` の既定コマンド
+# 2. `1-1` と `1-2` で direct vs two_stage 比較
+# 3. `3-1` で solver trace を作る
+# 4. `3-2` で solver-flow baseline を学習する
+# 5. `3-3` と `3-4` で full-phase multi-trace 学習へ進む
+# 6. `3-5` で 140 frame の online warm-start を比較する
+# 7. `3-6` で 240 / 2400 frame の比較を追加で回す
+# 8. 2400 frame の長尺既定値は、まず `mix=0.20` を確認する
+# 9. `phase_decay` は実験用で、現時点では既定値にしない
+
+
+# 3-7. learned corrector を学習する
+# 目的: predictor の次段で `z_blend -> z_corr` を学習的に補正する。
+# 環境: 学習は `miniconda -> raggedi`。
+bash -ic '
+miniconda
+conda activate raggedi
+cd /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow
+python scripts/train_solver_flow_corrector.py \
+  /tmp/solver_trace_angle45_dist50_fullphase/log_lastmile_cafm_solver_trace.npz \
+  /tmp/solver_trace_angle47_dist70_fullphase/log_lastmile_cafm_solver_trace.npz \
+  --device cuda --batch-size 64 --n-iters 1200 \
+  --eval-every 100 --log-every 50 \
+  --interp-min 0.10 --interp-max 0.90 --noise-scale 0.05 \
+  --output-dir /tmp/solver_flow_corrector_raggedi_angle45_angle47_fullphase_smoke
+'
+
+# 3-8. learned corrector の online smoke
+# 目的: short 140 frame で predictor-only より timing が悪化しないかを見る。
+# 2026-03-07 の 1 本目では baseline rerun 比 `prep mean -1.64ms`, `prep p99 -11.72ms`, `final corner delta 0.056mm`。
+bash -ic '
+cuda124
+source /home/initial/miniconda3/etc/profile.d/conda.sh
+conda activate asrti
+export LD_LIBRARY_PATH=/home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/acados_v0.3.2/lib:$LD_LIBRARY_PATH
+export WARP_CACHE_PATH=/tmp/warp-cache
+export XDG_CACHE_HOME=/tmp/xdg-cache
+PYTHONDONTWRITEBYTECODE=1 python -u \
+  /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/AS-RTI-acados/test_adjflow_cloth_lastmile.py \
+  --device cuda:0 --headless --viewer null \
+  --cloth --pin-edge --num-frames 140 \
+  --fold-npy /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20251209/cloth_trajectory_X24Y23_fan/unfold/trajectory_angle47_dist70.npy \
+  --cafm-checkpoint /home/initial/.local/share/ov/pkg/isaac-sim-4.5.0/cloth_folding_data_collection-main_20260206_newton/adjflow/checkpoints/grasp_cafm.pt \
+  --corner-source auto --corner-min-confidence 0.80 --cafm-inject-time 2.0 \
+  --lastmile-mode two_stage --lastmile-ramp-sec 0.50 \
+  --solver-flow-checkpoint /tmp/solver_flow_raggedi_angle45_angle47_fullphase/best_solver_flow.pt \
+  --solver-flow-device cuda --solver-flow-mix-policy auto --solver-flow-mix-short 0.50 --solver-flow-mix-long 0.20 --solver-flow-mix-short-max-frames 140 \
+  --solver-flow-min-confidence 0.50 \
+  --solver-flow-residual-threshold 1.0 --solver-flow-residual-min-scale 0.20 --solver-flow-residual-mode max_all \
+  --solver-flow-corrector-checkpoint /tmp/solver_flow_corrector_raggedi_angle45_angle47_fullphase_smoke/best_solver_flow_corrector.pt \
+  --solver-flow-corrector-device cuda --solver-flow-corrector-mix 0.20 --solver-flow-corrector-min-confidence 0.50 \
+  --output-dir /tmp/lastmile_gpu_140_t2_two_stage_angle47_solverflow_corrector_mix020
+'
